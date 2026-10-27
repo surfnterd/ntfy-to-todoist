@@ -12,6 +12,9 @@ Run it from cron every few minutes. Each run:
 4. A message titled "Resolved: <name>" (any priority) closes the open tasks
    whose title starts with <name>, with a comment saying why. A rules file can
    map one resolve name to several alert titles (see RESOLVE_RULES_FILE).
+5. Optional hold (HOLD_MINUTES): an alert waits that long before it becomes a
+   task, and a "Resolved:" during the wait drops it, so alerts that clear
+   themselves within minutes never reach Todoist. Off by default.
 
 `--dry-run` prints what it would do and writes nothing.
 
@@ -24,6 +27,9 @@ Config (environment variables):
     TODOIST_PRIORITY    1-4, Todoist API scale (4 = p1). Default 3 (= p2)
     MIN_PRIORITY        ntfy priority gate, default 4
     COOLDOWN_HOURS      default 24
+    HOLD_MINUTES        default 0 (create tasks straight away). Needs the script
+                        to keep running from cron: a held alert is created on the
+                        first run after its hold ends.
     EXCLUDE_TITLES      regex; matching alerts are never bridged
     RESOLVE_RULES_FILE  optional JSON: {"<resolve regex>": ["<alert title regex>", ...]}
                         "{0}" in an alert regex is filled with the resolve regex's
@@ -58,6 +64,7 @@ TASK_PREFIX = env("TASK_PREFIX", "⚠️ Alert: ")
 TASK_PRIORITY = int(env("TODOIST_PRIORITY", "3"))
 MIN_PRIORITY = int(env("MIN_PRIORITY", "4"))
 COOLDOWN = float(env("COOLDOWN_HOURS", "24")) * 3600
+HOLD = float(env("HOLD_MINUTES", "0")) * 60
 EXCLUDE = re.compile(env("EXCLUDE_TITLES", "(?!x)x"), re.IGNORECASE)
 STATE_FILE = pathlib.Path(env("STATE_FILE", "~/.local/state/ntfy-to-todoist.json")).expanduser()
 
@@ -145,12 +152,25 @@ def close_resolved(resolved):
         log(f"closed {task['id']} '{task['content']}'")
 
 
-def create_task(title, body):
+def drop_pending(pending, resolved):
+    """Forget held alerts that "Resolved: <resolved>" clears before their hold ended."""
+    pats = alert_patterns(resolved)
+    for key, held in list(pending.items()):
+        if any(re.match(p, held["title"]) for p in pats):
+            log(f"{'WOULD DROP' if DRY_RUN else 'dropped'} held alert "
+                f"(resolved before the hold ended): '{held['title']}'")
+            del pending[key]
+
+
+def create_task(title, body, first_seen=None):
     if DRY_RUN:
         log(f"WOULD CREATE '{TASK_PREFIX}{title}'")
         return
+    stamp = time.strftime('%Y-%m-%d %H:%M', time.localtime(first_seen or time.time()))
+    note = (f"(from ntfy, first seen {stamp}, not resolved after {HOLD / 60:g} min)"
+            if first_seen else f"(from ntfy, {stamp})")
     task = {"content": f"{TASK_PREFIX}{title}",
-            "description": body + f"\n\n(from ntfy, {time.strftime('%Y-%m-%d %H:%M')})",
+            "description": body + "\n\n" + note,
             "priority": TASK_PRIORITY}
     if PROJECT_ID:
         task["project_id"] = PROJECT_ID
@@ -159,9 +179,10 @@ def create_task(title, body):
 
 
 def main():
-    state = {"since": int(time.time()) - 600, "seen": [], "task_created": {}}
+    state = {"since": int(time.time()) - 600, "seen": [], "task_created": {}, "pending": {}}
     if STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text()))
+    pending = state.setdefault("pending", {})  # dedup key -> held alert
 
     headers = {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else {}
     req = urllib.request.Request(f"{NTFY_TOPIC_URL}/json?poll=1&since={state['since']}", headers=headers)
@@ -184,18 +205,37 @@ def main():
         try:
             # "Resolved:" notes are usually low priority, so handle them before the gate
             if title.startswith("Resolved: "):
-                close_resolved(title[len("Resolved: "):].strip())
+                resolved = title[len("Resolved: "):].strip()
+                drop_pending(pending, resolved)
+                close_resolved(resolved)
                 continue
             if m.get("priority", 3) < MIN_PRIORITY or EXCLUDE.search(title):
                 continue
             key = normalize(title)
-            if time.time() - state["task_created"].get(key, 0) < COOLDOWN:
+            if time.time() - state["task_created"].get(key, 0) < COOLDOWN or key in pending:
                 continue
-            create_task(title, (m.get("message") or "").strip()[:500])
+            body = (m.get("message") or "").strip()[:500]
+            if HOLD > 0:
+                pending[key] = {"title": title, "body": body, "first": m.get("time") or int(time.time())}
+                log(f"{'WOULD HOLD' if DRY_RUN else 'holding'} '{title}' for {HOLD / 60:g} min")
+                continue
+            create_task(title, body)
             state["task_created"][key] = int(time.time())
         except Exception as e:
             log(f"Todoist call failed for '{title}': {e}")
             sys.exit(1)  # leave state unsaved so the next run retries
+
+    # Held alerts whose hold is over and that nothing resolved: create them now.
+    for key, held in list(pending.items()):
+        if time.time() - held["first"] < HOLD:
+            continue
+        try:
+            create_task(held["title"], held["body"], first_seen=held["first"])
+        except Exception as e:
+            log(f"Todoist call failed for '{held['title']}': {e}")
+            sys.exit(1)
+        state["task_created"][key] = int(time.time())
+        del pending[key]
 
     if DRY_RUN:
         return

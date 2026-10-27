@@ -9,6 +9,7 @@ Push notifications are easy to swipe away. If an alert needs action (a failed ba
 - **Only urgent alerts cross.** Messages at ntfy priority 4 (high) or 5 (max) become tasks. Routine messages are ignored.
 - **No duplicate tasks.** An alert firing every two minutes creates one task per 24 hours, not hundreds. Numbers are collapsed before comparing titles, so `CPU 88% (load 18.1)` and `CPU 63% (load 17.0)` count as the same alert.
 - **Auto-close.** Send `Resolved: <name>` (any priority) and every open bridge task whose title starts with `<name>` gets a comment and is closed. A rules file handles alerts whose resolve message is worded differently (below).
+- **Optional hold.** Set `HOLD_MINUTES` and an alert waits that long before it becomes a task. If its `Resolved:` arrives during the wait, no task is made at all, so alerts that flap and clear themselves stay off your list. Off by default.
 - **Safe on failure.** If Todoist or ntfy errors, the run exits without saving its position, so the next run retries those messages.
 - `--dry-run` shows what it would create and close, and writes nothing.
 
@@ -36,6 +37,7 @@ Keep the tokens in an env file with 600 permissions rather than in your crontab.
 | `TODOIST_PRIORITY` | `3` | Todoist API scale, 4 = p1, 3 = p2 |
 | `MIN_PRIORITY` | `4` | ntfy priority gate |
 | `COOLDOWN_HOURS` | `24` | One task per alert title per this many hours |
+| `HOLD_MINUTES` | `0` | Wait this long before creating a task; a `Resolved:` in that time drops the alert. A held alert is created on the first run after its hold ends, so keep the cron running |
 | `EXCLUDE_TITLES` | none | Regex; matching alerts are never bridged (good for alerts that clear themselves) |
 | `RESOLVE_RULES_FILE` | none | JSON mapping resolve names to alert titles (below) |
 | `STATE_FILE` | `~/.local/state/ntfy-to-todoist.json` | Last-seen position and dedup times |
